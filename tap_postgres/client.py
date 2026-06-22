@@ -381,6 +381,7 @@ class PostgresLogBasedStream(SQLStream):
         last_data_message = run_start
         last_feedback_time = run_start
         records_yielded = 0
+        last_yielded_lsn: int | None = None
 
         while True:
             now = datetime.datetime.now()
@@ -401,6 +402,7 @@ class PostgresLogBasedStream(SQLStream):
                     row = self.consume(payload, message.data_start)
                     if row:
                         records_yielded += 1
+                        last_yielded_lsn = message.data_start
                         yield row
                     if (
                         datetime.datetime.now() - last_feedback_time
@@ -445,6 +447,7 @@ class PostgresLogBasedStream(SQLStream):
             logical_replication_cursor,
             start_lsn,
             context,
+            last_yielded_lsn=last_yielded_lsn,
         )
 
         logical_replication_cursor.close()
@@ -482,8 +485,9 @@ class PostgresLogBasedStream(SQLStream):
         replication_cursor: extras.ReplicationCursor,
         start_lsn: int,
         context: Context | None,
+        last_yielded_lsn: int | None = None,
     ) -> None:
-        """Advance the replication slot and bookmark to the current WAL tip.
+        """Advance the replication slot to WAL tip; advance bookmark to last yielded LSN.
 
         When ``add-tables`` filters out most WAL records, the slot's confirmed
         flush position can fall far behind the actual WAL tip, causing
@@ -493,16 +497,16 @@ class PostgresLogBasedStream(SQLStream):
         separate (regular) connection and, if it is ahead of ``start_lsn``:
 
         1. Sends ``send_feedback`` on the replication cursor so the slot can
-           release retained WAL.
-        2. Updates ``replication_key_value`` in the stream state so the next
-           sync resumes from the advanced position rather than re-scanning the
-           same WAL segment.
+           release retained WAL (always advances to WAL tip for disk retention).
+        2. Updates ``replication_key_value`` in the stream state to
+           ``last_yielded_lsn`` — the LSN of the last record actually emitted.
+           If no records were yielded this run, the bookmark stays at
+           ``start_lsn`` so the next sync re-scans from the same position.
 
-        Records between ``start_lsn`` and the new position for *other* tables
-        are irrelevant (filtered by ``add-tables``).  Any matching records for
-        *this* table that fell within the scanned window were already yielded
-        by ``get_records``; records beyond the scan window will be picked up
-        from the new, advanced position on the next run.
+        This separation ensures the PostgreSQL slot advances (preventing WAL
+        disk accumulation) while the Singer bookmark only moves as far as
+        records were actually consumed — preventing silent data loss when the
+        idle-exit window fires mid-burst.
         """
         flush_lsn: int | None = None
 
@@ -536,7 +540,11 @@ class PostgresLogBasedStream(SQLStream):
 
         state_dict = self.get_context_state(context)
         state_dict["replication_key"] = self.replication_key
-        state_dict["replication_key_value"] = flush_lsn
+        # Advance bookmark only to the last record actually emitted. If no records
+        # were yielded this run, keep the bookmark at start_lsn so the next run
+        # re-scans from the same position. The slot has already advanced to WAL tip
+        # above, which is needed for WAL retention regardless of record output.
+        state_dict["replication_key_value"] = last_yielded_lsn if last_yielded_lsn else start_lsn
 
     def _query_current_wal_lsn(self) -> int | None:
         """Query pg_current_wal_flush_lsn() and return the result as an int."""
