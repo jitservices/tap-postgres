@@ -513,7 +513,7 @@ class PostgresLogBasedStream(SQLStream):
         state_dict = self.get_context_state(context)
         state_dict["replication_key"] = self.replication_key
 
-        if last_yielded_lsn:
+        if last_yielded_lsn is not None:
             # Acknowledge through the last yielded record only.  WAL after
             # last_yielded_lsn is retained, so burst records are not lost.
             slot_advance_lsn = last_yielded_lsn + 1
@@ -526,12 +526,22 @@ class PostgresLogBasedStream(SQLStream):
                     (slot_advance_lsn - start_lsn) / (1024 * 1024),
                 )
             except Exception as exc:
+                # Slot did not advance; reset bookmark to start_lsn so the next
+                # run re-scans from the last confirmed position rather than
+                # diverging from the slot's actual confirmed_flush_lsn.
                 self.logger.warning("Failed to send final slot feedback: %s", exc)
+                state_dict["replication_key_value"] = start_lsn
                 return
             state_dict["replication_key_value"] = slot_advance_lsn
             return
 
-        # No records — advance slot to WAL tip to release idle WAL.
+        # No records this run — advance slot to WAL tip to release idle WAL.
+        # Known limitation: if burst records arrive between the replication
+        # session opening and the idle timer firing (i.e. records_yielded stays
+        # 0), this branch will advance the slot past them. The window is bounded
+        # by replication_idle_exit_seconds (30 s in prod) and requires exact
+        # timing; it is narrower than the original bug which fired unconditionally
+        # regardless of how many records had been yielded.
         flush_lsn: int | None = None
         try:
             wal_end = getattr(replication_cursor, "wal_end", 0) or 0
