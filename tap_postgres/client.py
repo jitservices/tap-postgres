@@ -535,38 +535,34 @@ class PostgresLogBasedStream(SQLStream):
             state_dict["replication_key_value"] = slot_advance_lsn
             return
 
-        # No records this run — advance slot to WAL tip to release idle WAL.
-        # Known limitation: if burst records arrive between the replication
-        # session opening and the idle timer firing (i.e. records_yielded stays
-        # 0), this branch will advance the slot past them. The window is bounded
-        # by replication_idle_exit_seconds (30 s in prod) and requires exact
-        # timing; it is narrower than the original bug which fired unconditionally
-        # regardless of how many records had been yielded.
-        flush_lsn: int | None = None
+        # No records this run — do NOT advance the slot.
+        #
+        # With add-tables filtering, all streams share a single replication
+        # slot and are processed serially in alphabetical order.  If any
+        # earlier stream advances the slot to WAL tip, all later streams lose
+        # access to WAL events (including DELETEs) that arrived between their
+        # bookmark and the advance point.  For example, if
+        # public-accounting_assignments (first alphabetically) advances to WAL
+        # tip, public-bills can no longer read DELETE events that were written
+        # between the bills bookmark and that advance — those WAL records are
+        # now eligible for PostgreSQL cleanup.
+        #
+        # Keeping the slot at start_lsn ensures every stream reads its own
+        # WAL window on the next run.  Active streams advance the slot
+        # naturally whenever they yield records (the last_yielded_lsn branch
+        # above).  Truly idle streams carry minimal WAL cost because their
+        # tables generate no events that need retaining.
         try:
             wal_end = getattr(replication_cursor, "wal_end", 0) or 0
-            if wal_end > start_lsn:
-                flush_lsn = wal_end
+            tip = wal_end if wal_end > start_lsn else (self._query_current_wal_lsn() or start_lsn)
         except Exception:
-            pass
-
-        if not flush_lsn or flush_lsn <= start_lsn:
-            flush_lsn = self._query_current_wal_lsn()
-
-        if not flush_lsn or flush_lsn <= start_lsn:
-            return
-
-        try:
-            replication_cursor.send_feedback(flush_lsn=flush_lsn)
-            self.logger.info(
-                "No records yielded; advanced slot to WAL tip %d (delta %.2f MB)",
-                flush_lsn,
-                (flush_lsn - start_lsn) / (1024 * 1024),
-            )
-        except Exception as exc:
-            self.logger.warning("Failed to send final slot feedback: %s", exc)
-            return
-
+            tip = start_lsn
+        self.logger.info(
+            "No records yielded; slot retained at %d (WAL tip ~%d, delta %.2f MB)",
+            start_lsn,
+            tip,
+            (tip - start_lsn) / (1024 * 1024),
+        )
         state_dict["replication_key_value"] = start_lsn
 
     def _query_current_wal_lsn(self) -> int | None:
